@@ -1,0 +1,65 @@
+# 生成 128x128 的测量矩阵 A 并保存为 npz
+# 用法示例 (本脚本默认生成 M_ratio=0.1 的 A):
+#   python scripts/generate_A_128.py --out measurement/A_1638x16384.npz
+#
+# 依赖: numpy, scipy
+
+import os
+import argparse
+import numpy as np
+from scipy.ndimage import gaussian_filter
+
+def generate_speckle_patterns(num_patterns, H, W, grain_sigma=2.0, seed=0):
+    rng = np.random.RandomState(seed)
+    patterns = rng.normal(size=(num_patterns, H, W))
+    for i in range(num_patterns):
+        patterns[i] = gaussian_filter(patterns[i], sigma=grain_sigma)
+    patterns = np.abs(patterns)
+    patterns -= patterns.min(axis=(1,2), keepdims=True)
+    patterns /= (patterns.max(axis=(1,2), keepdims=True) + 1e-12)
+    return patterns.astype(np.float32)
+
+def generate_illumination_patterns(num_patterns, H, W, p_on=0.5, seed=1):
+    rng = np.random.RandomState(seed)
+    patterns = rng.rand(num_patterns, H, W) < p_on
+    return patterns.astype(np.float32)
+
+def build_measurement_matrix(speckle_patterns, illum_patterns, normalize_rows=True):
+    assert speckle_patterns.shape == illum_patterns.shape
+    M, H, W = speckle_patterns.shape
+    N = H * W
+    A = (speckle_patterns * illum_patterns).reshape(M, N)
+    if normalize_rows:
+        row_norms = np.linalg.norm(A, axis=1, keepdims=True) + 1e-12
+        A = A / row_norms
+    return A.astype(np.float32)
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--H", type=int, default=128)
+    parser.add_argument("--W", type=int, default=128)
+    parser.add_argument("--M_ratio", type=float, default=0.1, help="压缩比 M/N")
+    parser.add_argument("--grain_sigma", type=float, default=2.0, help="speckle 粒径近似的高斯 sigma")
+    parser.add_argument("--p_on", type=float, default=0.5, help="binary illumination 的 1 概率")
+    parser.add_argument("--seed_speckle", type=int, default=0)
+    parser.add_argument("--seed_illum", type=int, default=1)
+    parser.add_argument("--normalize_rows", action="store_true", default=True)
+    parser.add_argument("--out", type=str, default="measurement/A_1638x16384.npz")
+    args = parser.parse_args()
+
+    H = args.H
+    W = args.W
+    N = H * W
+    M = max(1, int(np.round(N * args.M_ratio)))
+    print(f"Generating measurement matrix A with M={M}, N={N} (H={H},W={W})")
+    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+
+    speckle = generate_speckle_patterns(M, H, W, grain_sigma=args.grain_sigma, seed=args.seed_speckle)
+    illum = generate_illumination_patterns(M, H, W, p_on=args.p_on, seed=args.seed_illum)
+    A = build_measurement_matrix(speckle, illum, normalize_rows=args.normalize_rows)
+    np.savez_compressed(args.out, A=A, speckle_seed=args.seed_speckle, illum_seed=args.seed_illum,
+                        M=M, N=N, H=H, W=W, M_ratio=args.M_ratio)
+    print(f"Saved A to {args.out}, shape={A.shape}, dtype={A.dtype}")
+
+if __name__ == "__main__":
+    main()
