@@ -423,7 +423,7 @@ class EarlyStopping:
         self.early_stop = False
         self.val_loss_min = np.inf
         self.delta = delta
-        self.path = path or os.path.join(result_dir, 'best_model.pth')
+        self.path = path if path is not None else 'best_model.pth'
         self.trace_func = trace_func
         d = os.path.dirname(self.path)
         if d:
