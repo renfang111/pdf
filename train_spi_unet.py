@@ -36,30 +36,22 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from sklearn.preprocessing import MinMaxScaler
 from tqdm import tqdm
+import argparse
 
-# --------------------------- 配置 ---------------------------
-# 路径配置（请根据需要修改）
-psf_path = '/home/Lemingnan/projects/RF_project/mycode/res-dff/PSF_129_1.0.mat'
-data_bin_path = '/home/Lemingnan/projects/RF_project/mycode/res-dff/stl10/unlabeled_X.bin'
-result_dir = '/home/Lemingnan/projects/RF_project/mycode/res-dff/Opsf_GIUNet/model/Opsf1.0'
-tb_logdir = '/home/Lemingnan/projects/RF_project/mycode/res-dff/Opsf_GIUNet/logs'
-os.makedirs(result_dir, exist_ok=True)
-os.makedirs(tb_logdir, exist_ok=True)
-
-# 训练超参
-img_size_original = 96
-img_size = 128
-img_pixels = img_size * img_size
-base_nums = 128  # M
-batch_size = 64
-num_epochs = 100
-lr = 1e-3
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-use_amp = torch.cuda.is_available()
-
-print("Device:", device, "AMP:", use_amp)
-
-writer = SummaryWriter(log_dir=tb_logdir)
+# --------------------------- 默认配置 ---------------------------
+# 这些默认值可通过命令行参数覆盖
+DEFAULT_CONFIG = {
+    'psf_path': './PSF_129_1.0.mat',
+    'data_bin_path': './stl10/unlabeled_X.bin',
+    'result_dir': './outputs/model',
+    'tb_logdir': './outputs/logs',
+    'img_size_original': 96,
+    'img_size': 128,
+    'base_nums': 128,  # M
+    'batch_size': 64,
+    'num_epochs': 100,
+    'lr': 1e-3,
+}
 
 # --------------------------- 实用函数 ---------------------------
 def load_psf_from_mat(mat_path):
@@ -332,7 +324,7 @@ class Up(nn.Module):
         return x
 
 class UNet(nn.Module):
-    def __init__(self, n_channels, n_classes):
+    def __init__(self, n_channels, out_channels=1):
         super(UNet, self).__init__()
         self.inc = DoubleConv(n_channels, 64)
         self.down1 = Down(64, 128)
@@ -343,7 +335,8 @@ class UNet(nn.Module):
         self.up2 = Up(256, 128)
         self.up3 = Up(128, 64)
         self.up4 = Up(64, 32)
-        self.outc = nn.Conv2d(32, 1, kernel_size=1)
+        self.outc = nn.Conv2d(32, out_channels, kernel_size=1)
+        self.out_channels = out_channels
 
     def forward(self, x):
         x1 = self.inc(x)
@@ -356,18 +349,21 @@ class UNet(nn.Module):
         x = self.up3(x, x2)
         x = self.up4(x, x1)
         x = self.outc(x)
-        return x.squeeze(1)
+        if self.out_channels == 1:
+            return x.squeeze(1)
+        return x
 
 class SpiUNet(nn.Module):
-    def __init__(self, spi_model, unet_model):
+    def __init__(self, spi_model, unet_model, img_size=128):
         super(SpiUNet, self).__init__()
         self.spi = spi_model
         self.unet = unet_model
         self.sigmoid = nn.Sigmoid()
+        self.img_size = img_size
 
     def forward(self, x):
         x = self.spi(x)                # [B,1,H,W]
-        x = x.view(-1, 1, img_size, img_size)
+        x = x.view(-1, 1, self.img_size, self.img_size)
         x = self.unet(x)               # [B, H, W]
         x = self.sigmoid(x)
         return x
@@ -454,16 +450,25 @@ class EarlyStopping:
         torch.save(model.state_dict(), self.path)
         self.val_loss_min = val_loss
 
-    def load_best_weights(self, model):
-        model.load_state_dict(torch.load(self.path, map_location=next(model.parameters()).device))
+    def load_best_weights(self, model, device=None):
+        if device is None:
+            # Try to get device from model parameters, fallback to CPU
+            try:
+                device = next(model.parameters()).device
+            except StopIteration:
+                device = torch.device('cpu')
+        model.load_state_dict(torch.load(self.path, map_location=device))
         if self.verbose:
             self.trace_func(f'Loaded best model weights from {self.path}')
 
 # --------------------------- 可视化函数 ---------------------------
-def visualize_degraded_pattern(spi_model, psf_array=None, idx=None, save_path='pattern_degraded_compare.png', writer=None, tb_step=0):
+def visualize_degraded_pattern(spi_model, psf_array=None, idx=None, save_path='pattern_degraded_compare.png', 
+                               writer=None, tb_step=0, target_device=None):
     """
     在 CPU 上把 spi_model 当前 raw_params 的第 idx 列（或随机）可视化：原始 pattern vs degraded pattern。
     """
+    if target_device is None:
+        target_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     spi_model_cpu = spi_model.cpu()
     raw = spi_model_cpu.raw_params.detach().cpu()
     H = spi_model_cpu.img_size
@@ -521,16 +526,70 @@ def visualize_degraded_pattern(spi_model, psf_array=None, idx=None, save_path='p
     plt.close(fig)
 
     if writer is not None:
-        import numpy as _np
-        orig_chw = pattern_orig_vis[_np.newaxis, :, :]
-        deg_chw = degraded_vis[_np.newaxis, :, :]
+        orig_chw = pattern_orig_vis[np.newaxis, :, :]
+        deg_chw = degraded_vis[np.newaxis, :, :]
         combined = np.concatenate([orig_chw, deg_chw], axis=2)  # side-by-side
         writer.add_image('Pattern/Orig_vs_Degraded', combined, tb_step, dataformats='CHW')
     print(f"Saved pattern compare image to: {save_path} (idx {idx})")
-    spi_model.to(device)  # 把模型移回训练设备
+    spi_model.to(target_device)  # 把模型移回训练设备
 
 # --------------------------- 主训练流程 ---------------------------
+def parse_args():
+    parser = argparse.ArgumentParser(description='Ghost Imaging with UNet Reconstruction Training Script')
+    parser.add_argument('--psf_path', type=str, default=DEFAULT_CONFIG['psf_path'],
+                        help='Path to PSF .mat file')
+    parser.add_argument('--data_bin_path', type=str, default=DEFAULT_CONFIG['data_bin_path'],
+                        help='Path to STL-10 binary data file')
+    parser.add_argument('--result_dir', type=str, default=DEFAULT_CONFIG['result_dir'],
+                        help='Directory to save model checkpoints')
+    parser.add_argument('--tb_logdir', type=str, default=DEFAULT_CONFIG['tb_logdir'],
+                        help='TensorBoard log directory')
+    parser.add_argument('--img_size_original', type=int, default=DEFAULT_CONFIG['img_size_original'],
+                        help='Original image size (STL-10 default is 96)')
+    parser.add_argument('--img_size', type=int, default=DEFAULT_CONFIG['img_size'],
+                        help='Target image size after resize')
+    parser.add_argument('--base_nums', type=int, default=DEFAULT_CONFIG['base_nums'],
+                        help='Number of patterns (M)')
+    parser.add_argument('--batch_size', type=int, default=DEFAULT_CONFIG['batch_size'],
+                        help='Training batch size')
+    parser.add_argument('--num_epochs', type=int, default=DEFAULT_CONFIG['num_epochs'],
+                        help='Number of training epochs')
+    parser.add_argument('--lr', type=float, default=DEFAULT_CONFIG['lr'],
+                        help='Learning rate')
+    parser.add_argument('--constrain', type=str, default='sigmoid', choices=['sigmoid', 'ste_binary', 'none'],
+                        help='Pattern constraint type')
+    parser.add_argument('--no_amp', action='store_true',
+                        help='Disable mixed precision training')
+    return parser.parse_args()
+
 def main():
+    args = parse_args()
+    
+    # Configuration from arguments
+    psf_path = args.psf_path
+    data_bin_path = args.data_bin_path
+    result_dir = args.result_dir
+    tb_logdir = args.tb_logdir
+    img_size_original = args.img_size_original
+    img_size = args.img_size
+    img_pixels = img_size * img_size
+    base_nums = args.base_nums
+    batch_size = args.batch_size
+    num_epochs = args.num_epochs
+    lr = args.lr
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_amp = torch.cuda.is_available() and not args.no_amp
+    
+    print("Device:", device, "AMP:", use_amp)
+    
+    # Create directories
+    os.makedirs(result_dir, exist_ok=True)
+    os.makedirs(tb_logdir, exist_ok=True)
+    
+    # TensorBoard writer
+    writer = SummaryWriter(log_dir=tb_logdir)
+    
     # 加载数据（在 CPU 上）
     print("Loading dataset ...")
     x_all = load_dataset(data_bin_path, img_size_original=img_size_original, img_size_resized=img_size)
@@ -559,15 +618,15 @@ def main():
 
     # 初始化模型
     spi_model = Spi(img_size=img_size, img_pixels=img_pixels, base_nums=base_nums,
-                    psf_kernel=psf_arr, constrain='sigmoid', normalize_columns=True,
+                    psf_kernel=psf_arr, constrain=args.constrain, normalize_columns=True,
                     debug_save_dir=result_dir).to(device)
-    unet_model = UNet(n_channels=1, n_classes=img_size).to(device)
-    spi = SpiUNet(spi_model, unet_model).to(device)
+    unet_model = UNet(n_channels=1, out_channels=1).to(device)
+    spi = SpiUNet(spi_model, unet_model, img_size=img_size).to(device)
 
     # 可视化一个 pattern 的原始 vs degraded（写到文件和 TensorBoard）
     visualize_degraded_pattern(spi_model, psf_array=psf_arr, idx=None,
                                save_path=os.path.join(result_dir, 'pattern_compare_initial.png'),
-                               writer=writer, tb_step=0)
+                               writer=writer, tb_step=0, target_device=device)
 
     # 损失、优化器、scheduler、early stopping
     loss_fn = CombinedLoss(reg=0.01)
@@ -636,7 +695,7 @@ def main():
         early_stopping(total_test_loss, spi)
         if early_stopping.early_stop:
             print("Early stopping triggered. Loading best weights.")
-            early_stopping.load_best_weights(spi)
+            early_stopping.load_best_weights(spi, device=device)
             break
 
         # 记录一个测试样本的可视化和度量
@@ -664,12 +723,17 @@ def main():
         # 每隔若干 epoch 写入 pattern 可视化（退化前后）
         if epoch % 5 == 0:
             vis_path = os.path.join(result_dir, f'pattern_compare_epoch_{epoch+1}.png')
-            visualize_degraded_pattern(spi.spi, psf_array=psf_arr, idx=None, save_path=vis_path, writer=writer, tb_step=epoch)
+            visualize_degraded_pattern(spi.spi, psf_array=psf_arr, idx=None, save_path=vis_path, 
+                                      writer=writer, tb_step=epoch, target_device=device)
 
     # 保存 losses
-    import pandas as pd
-    losses_df = pd.DataFrame({'train_loss': train_losses, 'test_loss': test_losses})
-    losses_df.to_csv(os.path.join(result_dir, 'losses.csv'), index=False)
+    import csv
+    losses_path = os.path.join(result_dir, 'losses.csv')
+    with open(losses_path, 'w', newline='') as f:
+        writer_csv = csv.writer(f)
+        writer_csv.writerow(['train_loss', 'test_loss'])
+        for train_l, test_l in zip(train_losses, test_losses):
+            writer_csv.writerow([train_l, test_l])
 
     end_time = time.time()
     print(f"Training finished. Best val loss: {best_val_loss:.6f}")
